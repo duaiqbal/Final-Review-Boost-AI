@@ -15,7 +15,7 @@ import {
 } from "@/lib/api";
 
 type Answers = Record<string, string>;
-type Step = "welcome" | "feedback" | "draft" | "done";
+type Step = "welcome" | "feedback" | "done";
 
 const SLOW_AFTER_MS = 2500; // show a "waking up" message if the backend is slow (cold start)
 const RETRY_DELAYS_MS = [2000, 4000]; // retries for network failures only
@@ -83,7 +83,7 @@ function ReviewContent() {
   const [submitting, setSubmitting] = useState(false);
   const [copied, setCopied] = useState<boolean | null>(null);
   const [opened, setOpened] = useState(false);
-  const draftRef = useRef<HTMLTextAreaElement>(null);
+  const finalRef = useRef<HTMLTextAreaElement>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
 
   // ---- Load the business this QR code belongs to ----
@@ -143,7 +143,11 @@ function ReviewContent() {
     setError("");
   }
 
-  async function requestDraft(regenerate: boolean) {
+  /**
+   * One click does everything: open the destination tab now (while we still have the
+   * user gesture), generate the AI review, copy it, then point the tab at the review site.
+   */
+  async function generateCopyAndOpen() {
     if (!business || submitting) return;
     if (missingRequired.length > 0) {
       setError("Please answer: " + missingRequired.map((m) => m.name).join(", ") + ".");
@@ -153,51 +157,60 @@ function ReviewContent() {
       setError("Choose at least one rating or write a short comment.");
       return;
     }
+
+    // Open the destination tab synchronously so the browser keeps the user gesture.
+    // It will show about:blank for a moment, then we redirect it to the review site.
+    let win: Window | null = null;
+    if (business.review_destination_url) {
+      win = window.open("about:blank", "_blank");
+      if (win) win.opener = null;
+    }
+
     setSubmitting(true);
     setError("");
     try {
       const answerList = Object.entries(answers)
         .filter(([, rating]) => rating)
         .map(([category_id, rating]) => ({ category_id, rating }));
-      const result = await generateReview(business.id, answerList, comment.trim(), regenerate);
+      const result = await generateReview(business.id, answerList, comment.trim(), false);
       setDraft(result);
       setText(result.review);
       setNotice(result.warnings.join(" "));
-      setCopied(null);
-      if (step !== "draft") go("draft");
+
+      const didCopy = await copyText(result.review);
+      setCopied(didCopy);
+
+      let didOpen = false;
+      if (business.review_destination_url) {
+        if (win && !win.closed) {
+          win.location.href = business.review_destination_url;
+          didOpen = true;
+        } else {
+          // Popup was blocked; open on the current gesture chain as a best effort.
+          const w2 = window.open(business.review_destination_url, "_blank");
+          if (w2) w2.opener = null;
+          didOpen = Boolean(w2);
+        }
+      }
+      setOpened(didOpen);
+
+      if (!preview) trackCopyAndOpen(business.id).catch(() => {});
+      go("done");
     } catch (err) {
+      if (win && !win.closed) win.close();
       setError(getErrorMessage(err));
     } finally {
       setSubmitting(false);
     }
   }
 
-  async function handleCopy() {
+  async function handleCopyAgain() {
     const ok = await copyText(text);
     setCopied(ok);
-    if (!ok) selectDraft();
-  }
-
-  function selectDraft() {
-    draftRef.current?.focus();
-    draftRef.current?.select();
-  }
-
-  function handleCopyAndOpen() {
-    if (!business) return;
-    // Start the copy and open the tab inside the same click so browsers keep the user gesture.
-    const copyPromise = copyText(text);
-    let win: Window | null = null;
-    if (business.review_destination_url) {
-      win = window.open(business.review_destination_url, "_blank");
-      if (win) win.opener = null;
+    if (!ok && finalRef.current) {
+      finalRef.current.focus();
+      finalRef.current.select();
     }
-    if (!preview) trackCopyAndOpen(business.id).catch(() => {});
-    void copyPromise.then((ok) => {
-      setCopied(ok);
-      setOpened(Boolean(win));
-      go("done");
-    });
   }
 
   function startOver() {
@@ -241,7 +254,7 @@ function ReviewContent() {
     );
   }
 
-  const stepIndex = { welcome: 1, feedback: 2, draft: 3, done: 4 }[step];
+  const stepIndex = { welcome: 1, feedback: 2, done: 3 }[step];
 
   return (
     <main className="rb-page" style={styles}>
@@ -255,7 +268,7 @@ function ReviewContent() {
             ReviewBoost <strong>AI</strong>
           </span>
         </Link>
-        <span className="rb-top-note">Step {stepIndex} of 4</span>
+        <span className="rb-top-note">Step {stepIndex} of 3</span>
       </header>
 
       <section className="rb-card" aria-live="polite">
@@ -315,7 +328,7 @@ function ReviewContent() {
           </>
         )}
 
-        {/* ---------------- Screen 2: Feedback ---------------- */}
+        {/* ---------------- Screen 2: Feedback (one-click generate + copy + open) ---------------- */}
         {step === "feedback" && (
           <>
             <div className="rb-intro">
@@ -408,33 +421,49 @@ function ReviewContent() {
             <button
               type="button"
               className="rb-submit"
-              onClick={() => requestDraft(false)}
+              onClick={generateCopyAndOpen}
               disabled={submitting}
             >
-              <span>{submitting ? "Writing your draft..." : "Generate my review draft"}</span>
-              {!submitting && <span className="rb-submit-arrow">{"\u2192"}</span>}
+              <span>
+                {submitting ? "Generating your review..." : "Generate review & open review page"}
+              </span>
+              {!submitting && <span className="rb-submit-arrow">{"\u2197"}</span>}
             </button>
+            <p className="rb-honesty" style={{ marginTop: 10 }}>
+              <span>*</span>
+              One tap writes your review, copies it, and opens the review page.
+            </p>
             <button type="button" className="rb-reset" onClick={() => go("welcome")}>
               {"\u2190"} Back
             </button>
           </>
         )}
 
-        {/* ---------------- Screen 3: Draft ---------------- */}
-        {step === "draft" && draft && (
+        {/* ---------------- Screen 3: Done ---------------- */}
+        {step === "done" && (
           <>
             <div className="rb-intro">
-              <span className="rb-kicker">YOUR DRAFT</span>
+              <span className="rb-kicker">LAST STEP</span>
               <h1 ref={headingRef} tabIndex={-1} className="rb-step-heading">
-                Review and edit your draft
+                Paste and post your review
               </h1>
               <p>
-                {draft.source === "ai"
-                  ? "Written by AI from your answers only. Change anything that isn't accurate."
-                  : "AI was unavailable, so this simple draft was built from your ratings. Feel free to edit it."}
+                {copied
+                  ? "Your review is written and copied. "
+                  : "Your review is written below. Copy it, then "}
+                {opened
+                  ? "Switch to the review page that just opened, paste the review, and press submit."
+                  : "open the review page below, paste the review, and press submit."}{" "}
+                Your review is only published once you submit it there.
               </p>
             </div>
 
+            {draft && draft.source === "fallback" && (
+              <div className="rb-alert rb-alert-success" role="status">
+                <span>i</span>
+                <p>AI was busy, so this review was built from your ratings. You can edit it before posting.</p>
+              </div>
+            )}
             {notice && (
               <div className="rb-alert rb-alert-success" role="status">
                 <span>i</span>
@@ -443,92 +472,30 @@ function ReviewContent() {
             )}
 
             <div className="rb-fallback">
-              <label htmlFor="rb-draft">Draft (editable)</label>
+              <label htmlFor="rb-final">Your review (editable)</label>
               <textarea
-                id="rb-draft"
-                ref={draftRef}
+                id="rb-final"
+                ref={finalRef}
                 value={text}
                 onChange={(e) => {
                   setText(e.target.value);
                   setCopied(null);
                 }}
                 rows={6}
+                onFocus={(e) => e.target.select()}
               />
-              <p style={{ margin: 0, color: "#5f7390", fontSize: 11, lineHeight: 1.6 }}>
-                {draft.source === "ai"
-                  ? draft.disclaimer
-                  : "This draft was built from your ratings only. Please read it, edit it, and make sure it reflects your real experience before posting."}
-              </p>
-              {copied === true && <p className="rb-copy-ok" role="status">Copied to clipboard.</p>}
+              {copied === true && (
+                <p className="rb-copy-ok" role="status">
+                  Copied to your clipboard.
+                </p>
+              )}
               {copied === false && (
                 <p className="rb-alert rb-alert-error" role="alert" style={{ margin: 0 }}>
                   <span>!</span>
-                  Automatic copy is blocked here. The text is selected: use your device&apos;s Copy option.
+                  Automatic copy did not work. Tap &quot;Copy review&quot; below, or select the text and copy it.
                 </p>
               )}
             </div>
-
-            {error && (
-              <div className="rb-alert rb-alert-error" role="alert">
-                <span>!</span>
-                <p>{error}</p>
-              </div>
-            )}
-
-            {business.review_destination_url ? (
-              <button type="button" className="rb-submit" onClick={handleCopyAndOpen} disabled={!text.trim()}>
-                <span>Copy &amp; open review page</span>
-                <span className="rb-submit-arrow">{"\u2197"}</span>
-              </button>
-            ) : (
-              <p className="rb-alert rb-alert-error" role="status">
-                <span>!</span>
-                This business hasn&apos;t set a review page yet. You can still copy your draft.
-              </p>
-            )}
-
-            <div className="rb-step-actions">
-              <button type="button" className="rb-copy-button" onClick={handleCopy} disabled={!text.trim()}>
-                Copy text
-              </button>
-              <button
-                type="button"
-                className="rb-copy-button"
-                onClick={() => requestDraft(true)}
-                disabled={submitting}
-              >
-                {submitting ? "Rewriting..." : "Regenerate"}
-              </button>
-              <button type="button" className="rb-copy-button" onClick={() => go("feedback")}>
-                {"\u2190"} Edit feedback
-              </button>
-            </div>
-          </>
-        )}
-
-        {/* ---------------- Screen 4: Done ---------------- */}
-        {step === "done" && (
-          <>
-            <div className="rb-intro">
-              <span className="rb-kicker">ALMOST DONE</span>
-              <h1 ref={headingRef} tabIndex={-1} className="rb-step-heading">
-                Paste and post your review
-              </h1>
-              <p>
-                {copied ? "Your draft is copied. " : "Your draft could not be copied automatically. "}
-                {opened
-                  ? "The review page opened in a new tab: paste the text there and press submit."
-                  : "Open the review page below, paste the text and press submit."}{" "}
-                Your review is only published once you submit it on that site.
-              </p>
-            </div>
-
-            {!copied && (
-              <div className="rb-fallback">
-                <label htmlFor="rb-final">Your review text</label>
-                <textarea id="rb-final" ref={draftRef} value={text} readOnly rows={5} onFocus={(e) => e.target.select()} />
-              </div>
-            )}
 
             {business.review_destination_url && (
               <a
@@ -543,11 +510,11 @@ function ReviewContent() {
               </a>
             )}
             <div className="rb-step-actions">
-              <button type="button" className="rb-copy-button" onClick={handleCopy}>
-                {copied ? "Copy again" : "Try copying again"}
+              <button type="button" className="rb-copy-button" onClick={handleCopyAgain} disabled={!text.trim()}>
+                {copied ? "Copy again" : "Copy review"}
               </button>
-              <button type="button" className="rb-copy-button" onClick={() => go("draft")}>
-                {"\u2190"} Back to draft
+              <button type="button" className="rb-copy-button" onClick={() => go("feedback")}>
+                {"\u2190"} Change answers
               </button>
               <button type="button" className="rb-copy-button" onClick={startOver}>
                 Start over

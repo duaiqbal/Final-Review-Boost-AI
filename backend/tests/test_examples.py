@@ -59,3 +59,69 @@ def test_key_cleanup_and_fingerprint():
         fp = ai_service.key_fingerprint()
     assert fp == {"present": True, "length": len(k), "starts_with_AIza": True, "last4": "6789"}
     assert k not in str(fp)
+
+
+def test_fatal_key_error_falls_back_without_wasting_attempts():
+    """A 401-style error must fall back immediately, not burn all retry attempts."""
+    from unittest.mock import patch
+    from app import ai_service
+    from app.config import settings
+    from app.guardrails import RatedItem, ReviewContext
+
+    ctx = ReviewContext("Cafe", "Cafe", [RatedItem("Service", "", "Good", 3, "positive")], "")
+    calls = {"n": 0}
+
+    class FatalErr(Exception):
+        code = 401
+
+    def fake(prompt, regen, model):
+        calls["n"] += 1
+        raise FatalErr("401 API key not valid")
+
+    with patch.object(settings, "GEMINI_API_KEY", "AIzaFAKE"), \
+         patch.object(settings, "GEMINI_FALLBACK_MODEL", ""), \
+         patch.object(ai_service, "_call_gemini", side_effect=fake):
+        result = ai_service.generate_review_draft(ctx)
+    assert result["source"] == "fallback"
+    assert result["fallback_reason"] == "ai_unavailable"
+    assert calls["n"] == 1  # stopped after the first fatal error
+
+
+def test_fatal_error_tries_fallback_model_once():
+    from unittest.mock import patch
+    from app import ai_service
+    from app.config import settings
+    from app.guardrails import RatedItem, ReviewContext
+
+    ctx = ReviewContext("Cafe", "Cafe", [RatedItem("Service", "", "Good", 3, "positive")], "")
+    seen = []
+
+    class FatalErr(Exception):
+        code = 404
+
+    def fake(prompt, regen, model):
+        seen.append(model)
+        if model == "primary-model":
+            raise FatalErr("404 model not found")
+        return '{"review": "I visited Cafe and the Service was good."}'
+
+    with patch.object(settings, "GEMINI_API_KEY", "AIzaFAKE"), \
+         patch.object(settings, "GEMINI_MODEL", "primary-model"), \
+         patch.object(settings, "GEMINI_FALLBACK_MODEL", "backup-model"), \
+         patch.object(ai_service, "_call_gemini", side_effect=fake):
+        result = ai_service.generate_review_draft(ctx)
+    assert seen == ["primary-model", "backup-model"]
+    assert result["source"] == "ai"
+
+
+def test_is_fatal_classification():
+    from app import ai_service
+
+    class E(Exception):
+        def __init__(self, msg, code=None):
+            super().__init__(msg)
+            self.code = code
+    assert ai_service._is_fatal(E("bad", 401))
+    assert ai_service._is_fatal(E("API key not valid"))
+    assert not ai_service._is_fatal(E("503 service unavailable", 503))
+    assert not ai_service._is_fatal(E("timeout"))

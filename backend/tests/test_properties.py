@@ -130,7 +130,7 @@ def test_property_7_total_failure_fallback(mode, comment, regenerate):
     responses = {"raise": None, "bad_json": "not json at all",
                  "unsafe": '{"review": "Visit https://spam.com now"}'}
 
-    def fake(prompt, regen):
+    def fake(prompt, regen, model):
         if mode == "raise":
             raise ConnectionError("down")
         return responses[mode]
